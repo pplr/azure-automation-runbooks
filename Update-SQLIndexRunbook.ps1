@@ -46,8 +46,8 @@
     Update-SQLIndexRunbook -SqlServer "server.database.windows.net" -Database "Finance" -SQLCredentialName "FinanceCredentials" -Table "Customers" -RebuildOffline $True 
  
 .NOTES 
-    AUTHOR: System Center Automation Team 
-    LASTEDIT: Oct 8th, 2014  
+    AUTHORS: System Center Automation Team, Pierre Paysant-Le Roux
+    LASTEDIT: Sep 25th, 2015
 #> 
 workflow Update-SQLIndexRunbook 
 { 
@@ -85,7 +85,7 @@ workflow Update-SQLIndexRunbook
     $SqlUsername = $SqlCredential.UserName  
     $SqlPass = $SqlCredential.GetNetworkCredential().Password 
      
-    $TableNames = Inlinescript { 
+    $TableAndIndexes = Inlinescript { 
        
         # Define the connection to the SQL Database 
         $Conn = New-Object System.Data.SqlClient.SqlConnection("Server=tcp:$using:SqlServer,$using:SqlServerPort;Database=$using:Database;User ID=$using:SqlUsername;Password=$using:SqlPass;Trusted_Connection=False;Encrypt=True;Connection Timeout=30;") 
@@ -93,19 +93,22 @@ workflow Update-SQLIndexRunbook
         # Open the SQL connection 
         $Conn.Open() 
          
-        # SQL command to find tables and their average fragmentation 
-        $SQLCommandString = @" 
-        SELECT a.object_id, avg_fragmentation_in_percent 
-        FROM sys.dm_db_index_physical_stats ( 
-               DB_ID(N'$Database') 
-             , OBJECT_ID(0) 
-             , NULL 
-             , NULL 
-             , NULL) AS a 
-        JOIN sys.indexes AS b  
-        ON a.object_id = b.object_id AND a.index_id = b.index_id; 
-"@ 
-        # Return the tables with their corresponding average fragmentation 
+        # SQL command to find indexes and their average fragmentation
+	$SQLCommandString = @"
+        SELECT t.name AS TableName, i.name AS IndexName, s.avg_fragmentation_in_percent
+        FROM sys.dm_db_index_physical_stats (
+               DB_ID(N'$Database')
+             , OBJECT_ID(0)
+             , NULL
+             , NULL
+             , NULL) AS s
+        JOIN sys.indexes AS i 
+        ON s.object_id = i.object_id AND s.index_id = i.index_id
+		JOIN sys.tables AS t
+		ON t.object_id = s.object_id;
+"@
+
+        # Return the indexes with their corresponding average fragmentation 
         $Cmd=new-object system.Data.SqlClient.SqlCommand($SQLCommandString, $Conn) 
         $Cmd.CommandTimeout=120 
          
@@ -115,73 +118,46 @@ workflow Update-SQLIndexRunbook
         [void]$Da.fill($FragmentedTable) 
  
   
-        # Get the list of tables with their object ids 
-        $SQLCommandString = @" 
-        SELECT  t.name AS TableName, t.OBJECT_ID FROM sys.tables t 
-"@ 
- 
-        $Cmd=new-object system.Data.SqlClient.SqlCommand($SQLCommandString, $Conn) 
-        $Cmd.CommandTimeout=120 
- 
-        # Execute the SQL command 
-        $TableSchema =New-Object system.Data.DataSet 
-        $Da=New-Object system.Data.SqlClient.SqlDataAdapter($Cmd) 
-        [void]$Da.fill($TableSchema) 
- 
- 
         # Return the table names that have high fragmentation 
         ForEach ($FragTable in $FragmentedTable.Tables[0]) 
         { 
-            Write-Verbose ("Table Object ID:" + $FragTable.Item("object_id")) 
-            Write-Verbose ("Fragmentation:" + $FragTable.Item("avg_fragmentation_in_percent")) 
+            Write-Verbose ("Table name:" + $FragTable.TableName)
+            Write-Verbose ("Index name:" + $FragTable.IndexName)
+            Write-Verbose ("Fragmentation:" + $FragTable.Item("avg_fragmentation_in_percent"))
              
             If ($FragTable.avg_fragmentation_in_percent -ge $Using:FragPercentage) 
             { 
-                # Table is fragmented. Return this table for indexing by finding its name 
-                ForEach($Id in $TableSchema.Tables[0]) 
-                { 
-                    if ($Id.OBJECT_ID -eq $FragTable.object_id.ToString()) 
-                     { 
-                        # Found the table name for this table object id. Return it 
-                        Write-Verbose ("Found a table to index! : " +  $Id.Item("TableName")) 
-                        $Id.TableName 
-                    } 
-                } 
+                # Index is fragmented. 
+                # If a specific table was specified, then return this index only if it one of this table
+                If ($Table -eq $null -or $Table -eq $FragTable.TableName)
+		{
+                    Write-Verbose ("This index has to be rebuilt")
+                    $info = @{}
+                    $info.TableName = $FragTable.TableName
+                    $info.IndexName = $FragTable.IndexName
+                    $info
+                }
             } 
         } 
  
         $Conn.Close() 
     } 
  
-    # If a specific table was specified, then find this table if it needs to indexed, otherwise 
-    # set the TableNames to $null since we shouldn't process any other tables. 
-    If ($Table) 
-    { 
-        Write-Verbose ("Single Table specified: $Table") 
-        If ($TableNames -contains $Table) 
-        { 
-            $TableNames = $Table 
-        } 
-        Else 
-        { 
-            # Remove other tables since only a specific table was specified. 
-            Write-Verbose ("Table not found: $Table") 
-            $TableNames = $Null 
-        } 
-    } 
- 
-    # Interate through tables with high fragmentation and rebuild indexes 
-    ForEach ($TableName in $TableNames) 
+    # Interate through indexes with high fragmentation and rebuild it 
+    ForEach ($TableAndIndex in $TableAndIndexes) 
     { 
       Write-Verbose "Creating checkpoint" 
       Checkpoint-Workflow 
-      Write-Verbose "Indexing Table $TableName..." 
-       
+
+      $TableName = $TableAndIndex.TableName
+      $IndexName = $TableAndIndex.IndexName
+      Write-Verbose "Indexing $IndexName in table $TableName..."
+      
       InlineScript { 
            
-        $SQLCommandString = @" 
-        EXEC('ALTER INDEX ALL ON $Using:TableName REBUILD with (ONLINE=ON)') 
-"@ 
+        $SQLCommandString = @"
+        EXEC('ALTER INDEX [$Using:IndexName] ON [$Using:TableName] REBUILD with (ONLINE=ON)')
+"@
  
         # Define the connection to the SQL Database 
         $Conn = New-Object System.Data.SqlClient.SqlConnection("Server=tcp:$using:SqlServer,$using:SqlServerPort;Database=$using:Database;User ID=$using:SqlUsername;Password=$using:SqlPass;Trusted_Connection=False;Encrypt=True;Connection Timeout=30;") 
@@ -189,7 +165,7 @@ workflow Update-SQLIndexRunbook
         # Open the SQL connection 
         $Conn.Open() 
  
-        # Define the SQL command to run. In this case we are getting the number of rows in the table 
+        # Define the SQL command to run. 
         $Cmd=new-object system.Data.SqlClient.SqlCommand($SQLCommandString, $Conn) 
         # Set the Timeout to be less than 30 minutes since the job will get queued if > 30 
         # Setting to 25 minutes to be safe. 
@@ -208,7 +184,7 @@ workflow Update-SQLIndexRunbook
             { 
                 Write-Verbose ("Building table $Using:TableName offline") 
                 $SQLCommandString = @" 
-                EXEC('ALTER INDEX ALL ON $Using:TableName REBUILD') 
+                EXEC('ALTER INDEX [$Using:IndexName] ON $Using:TableName REBUILD') 
 "@               
  
                 # Define the SQL command to run.  
@@ -225,7 +201,7 @@ workflow Update-SQLIndexRunbook
             Else 
             { 
                 # Will catch the exception here so other tables can be processed. 
-                Write-Error "Table $Using:TableName could not be indexed. Investigate indexing each index instead of the complete table $_" 
+                Write-Error "Index $Using:IndexName on table $Using:TableName could not be rebuilt $_" 
              } 
         } 
         # Close the SQL connection 
